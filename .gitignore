@@ -1,0 +1,6 @@
+matekane
+tests/run_tests
+output.txt
+output3d.csv
+*.png
+__pycache__/

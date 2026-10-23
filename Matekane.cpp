@@ -1,204 +1,246 @@
-/* Final Assignment - Matekane Airstrip
-**created December 8, 2011 by metafalsevac
+/* Matekane Airstrip takeoff simulation
+** created December 8, 2011 by metafalsevac
 **
+** 2D mode : original vertical-plane point-mass model (wind axes, flight-path angle).
+** 3D mode : 6-DOF rigid-body model with unit-quaternion attitude (src/sim3d.hpp).
+** Integrators: rk4 (default), rk45 (adaptive Dormand-Prince), lie-rk4 / lie-rk45 (3D only,
+** Runge-Kutta-Munthe-Kaas: quaternion stays exactly on the unit sphere).
+**
+** Run `matekane --help` for options. With no --cl* options the program prompts for the
+** lift-coefficient sweep interactively, like the original.
 */
-#include <iostream>
-#include <fstream>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <iomanip>
+#include <iostream>
+#include <stdexcept>
+#include <string>
 
-#include <limits>
+#include "src/integrators.hpp"
+#include "src/model.hpp"
+#include "src/sim2d.hpp"
+#include "src/sim3d.hpp"
 
-// Physical constants. These used to be single-letter #define macros (a, R, W, m, S, g),
-// which silently rewrite every later identifier with the same name; typed constants are safe.
-constexpr double T0 = 518.67;     //sea level temperature in Rankine
-constexpr double P0 = 2116.224;   //sea level pressure in lb/ft^2
-constexpr double a = -0.003566;   //Temperature Lapse Rate in Rankine/ft
-constexpr double R = 1716.0;      //Specific Gas Constant for air in ft*lbf/slug/degree Rankine
-constexpr double W = 2712.5;      //modified weight in pounds (3100 lb reduced by 12.5%)
-constexpr double g = 32.2;        //gravitational acceleration in ft/sec^2
-constexpr double m = W / g;       //modified mass in slugs (= 84.2391...)
-constexpr double S = 195.75;      //modified reference area in sq ft (174 sq ft +12.5%)
-constexpr double CLMax = 2.195;   //maximum (stall) lift coefficient
-constexpr double T0SL = 714.9375; //modified max sea level thrust in pounds (635.5 lb +12.5%)
-constexpr double aSL = 0.0334;    //airspeed variation coefficient for max thrust at sea level in lbs*sec^2/ft^2
-constexpr double Vxw0 = 83.0;     //initial condition for Vxw (true airspeed) in ft/s
-constexpr double X0 = 0.0;        //initial x distance
-constexpr double gamma0 = 0.0;    //initial flight path angle gamma (radians)
-constexpr double H0 = 7649.63;    //initial altitude in feet (= Ground(0))
-constexpr double XLevel = 6233.58;  //beyond this x the ground is level
-constexpr double HLevel = 7480.58;  //elevation of the level ground
-constexpr double XEnd = 10000.0;    //integrate until this x
-constexpr double TMax = 600.0;      //safety limit on simulated time (s) to avoid infinite loops
-constexpr double DT = 0.1;          //RK4 time step (s)
+using namespace mk;
 
-using namespace std;
+namespace {
 
-double Ground (double x); //calculates elevation of ground at horizontal distance x
-double Press (double h); //calculates pressure at altitude
-double Temp (double h); //calculates temperature at altitude
-double Rho (double h); //calculates rho at altitude
-double Veas (double vtrue, double h); //calculates equivalent airspeed
-double Vdot (double vxw, double gamma, double h, double CD); //Vxwind derivative
-double Gammadot (double vxw, double gamma, double h, double CL); //gamma derivative
-double Hdot (double vxw, double gamma); //H derivative
-double Xdot (double vxw, double gamma); //X derivative
-void RK (double vxw, double gamma, double h, double x, double y[6], double CD, double CL); //function for 4th order runge kutta integration
-                                                                                           //this function is void because it needs to return 6 values
-                                                                                           //it does so using arrays, which are treated as pointers
-int main(){
-double y[6], CLmin, CLmax, step;//array used to return results of integration
-double CL, CD;
+constexpr double DEG = M_PI / 180.0;
 
-ofstream outfile ("output.txt");//open output file
-outfile << "# x(ft)  h(ft)  V(ft/s)  ground(ft)  gamma(rad)  Veas(ft/s)  CL" << endl;
+struct Config {
+    std::string mode = "2d";
+    Method method = Method::RK4;
+    IntegratorOptions io;
+    double tmax = 600.0;  // safety limit on simulated time, s
+    bool have_cl = false;
+    double cl_min = 0, cl_max = 0, cl_step = 0.1;
+    std::string out;
+    Params3D p3;
+    bool stats = false;
+};
 
-cout << "Takeoff From Matekane Airstrip\n\n";
-cout << "This program will simulate takeoff from the Matekane Airstrip \nat various lift coefficients.\n\nInput minimum lift coefficient: ";
-cin >> CLmin;
-cout << "\nInput maximum lift coefficient: ";
-cin >> CLmax;
-cout << "\nInput lift coefficient step size: ";
-cin >> step;
-cout << endl;
-
-//input validation: a zero/negative step used to loop forever
-if (!cin || !(step > 0.0) || CLmax < CLmin) {
-   cout << "Invalid input: need CLmin <= CLmax and step > 0." << endl;
-   return 1;
-   }
-
-//run RK for multiple CL values. An integer counter is used because accumulating
-//"CL += step" in floating point skips the last value (e.g. 1.0..2.0 step 0.1 never ran CL = 2.0)
-int nCL = (int)floor((CLmax - CLmin)/step + 1e-9) + 1;
-for (int i = 0; i < nCL; ++i) {
-CL = CLmin + i*step;
-if (CL > CLMax + 1e-12) {
-   cout << "CL = " << CL << " exceeds CLMax = " << CLMax << " (stalled wing) - skipped" << endl << endl;
-   continue;
-   }
-y[0] = Vxw0;//must reset ALL initial conditions each iteration
-y[1] = gamma0;
-y[2] = H0;
-y[3] = X0;
-y[4] = Ground(X0);
-y[5] = Veas(Vxw0, H0);//previously not reset, so each run's first output row carried the previous run's final Veas
-CD = 0.025 + 0.056*CL*CL;
-double t = 0.0;
-bool crashed = false, diverged = false;
-
-    while (y[3]<=XEnd) {//while still in the valley, the while loop actually runs the integration past the far end of the valley to determine if the plane continues to gain altitude
-      outfile << y[3] << "     " << y[2] << "     " << y[0] << "      " << y[4] << "     " << y[1] << "     " << y[5] << "     " << CL << endl;
-      double xPrev = y[3], hPrev = y[2], gPrev = y[4];
-
-      RK (y[0], y[1], y[2], y[3], y, CD, CL);//call runge kutta function
-      t += DT;
-
-      if (!isfinite(y[0]) || !isfinite(y[1]) || y[0] <= 0.0 || t > TMax) {//airspeed lost / time limit: avoid NaN or an endless loop
-         cout << "CL = " << CL << " NO RESULT (airspeed lost or time limit reached) at t = " << t << " s" << endl << endl;
-         diverged = true;
-         break;
-         }
-
-      if ((y[4]>=y[2])){//did plane crash?
-         //the crash is only detected after the step that went below ground; interpolate the touchdown point
-         double c0 = hPrev - gPrev, c1 = y[2] - y[4];
-         double xTouch = xPrev + (y[3] - xPrev) * (c0 / (c0 - c1));
-         cout << "CL = " << CL << " CRASH!!!" << endl;
-         cout << "Vxw = " << y[0] << " gamma = " << y[1] << " Alt = " << y[2] << " x = " << y[3] << " Elev = " << y[4] << "\nEquiv Airspeed = " << y[5] << "\nTouchdown (interpolated) x = " << xTouch << endl << endl;//coordinates and flight conditions at crash
-         crashed = true;
-         break;
-                      }//if
-
-                           }//while
-      if (!crashed && !diverged && (y[3]>XLevel)&&y[2]>y[4]){
-         cout << "CL = " << CL << " SURVIVE!!!" << endl;
-         cout << "Vxw = " << y[0] << " gamma = " << y[1] << " Alt = " << y[2] << " x = " << y[3] << " Elev = " << y[4] << "\nEquiv Airspeed = " << y[5] << endl << endl;
-                     }//if
-                                       }//for
-
-
-outfile.close();//close output file
-cin.get();
-cin.get();
-return 0;
+void usage() {
+    std::cout <<
+R"(Usage: matekane [options]
+  --mode 2d|3d             simulation model (default 2d)
+  --integrator NAME        rk4 (default) | rk45 | lie-rk4 | lie-rk45   (lie-* need --mode 3d)
+  --dt S                   rk4 step and output interval, s (default 0.1)
+  --rtol X --atol X        rk45 tolerances (default 1e-8, 1e-8)
+  --cl X                   simulate a single lift coefficient
+  --cl-min X --cl-max X --cl-step X   lift coefficient sweep (prompted for if omitted)
+  --tmax S                 simulated-time limit per run, s (default 600)
+  --out FILE               trajectory output (default output.txt for 2d, output3d.csv for 3d)
+  3D only:
+  --aileron DEG --elevator DEG --rudder DEG   constant control deflections
+  --no-renorm              do not renormalise the quaternion after rk4/rk45 steps
+  --stats                  print integrator step / function-evaluation counts
+)";
 }
 
-double Ground (double x) {//determines ground elevation at horizontal x distance
-       if (x > XLevel) return HLevel;//ground is level at far end of valley (polynomial is continuous there: 7480.579)
-       double H = -7.54673e-12*x*x*x*x + 9.16044e-8*x*x*x - 1.8723e-4*x*x - 5.91546e-1*x + 7.64963e3;
-       return H;
-       }
+double num(int& i, int argc, char** argv) {
+    if (i + 1 >= argc) throw std::invalid_argument(std::string("missing value for ") + argv[i]);
+    char* end = nullptr;
+    double v = std::strtod(argv[++i], &end);
+    if (!end || *end) throw std::invalid_argument(std::string("bad number: ") + argv[i]);
+    return v;
+}
 
-double Press (double h) {//determine pressure at altitude 
-       double p = P0 * pow((1 + (a*h/T0)), 5.2561);
-       return p;
-       }
-       
-double Temp (double h) {//determine temp at altitude
-       double t = T0 + a*h;
-       return t;
-       }
-       
-double Rho (double h) {//determine dens at altitude
-       double rho = Press(h)/(R*Temp(h));
-       return rho;
-       }
-       
-double Veas (double vtrue, double h) {
-       double veas = pow((Rho(h)/Rho(0)),0.5)*vtrue;
-       return veas;
-       }
-       
-double Vdot (double vxw, double gamma, double h, double CD) {//derivative of velocity i.e. acceleration
-       double vdot = ( (Rho(h)/(m*Rho(0))) * (T0SL-(aSL*vxw*vxw)) - (Rho(h)*vxw*vxw*S*CD/(2*m)) - g*sin(gamma) );
-       return vdot;
-       }
-       
-double Gammadot (double vxw, double gamma, double h, double CL) {//derivative of flight path angle
-       double gammadot = -( (g*cos(gamma)/vxw) - (Rho(h)*vxw*S*CL/(2*m)) );
-       return gammadot;
-       }
-       
-double Hdot (double vxw, double gamma) {//vertical speed
-       double hdot = vxw*sin(gamma);
-       return hdot;
-       }
-       
-double Xdot (double vxw, double gamma) {//horizontal speed
-       double xdot = vxw*cos(gamma);
-       return xdot;
-       }
-       
-void RK (double vxw, double gamma, double h, double x, double y[], double CD, double CL) {//runge kutta. this function is void and uses Arrays to return results of integration
-       double delta = DT;//increment
-       double k11, k12, k13, k14, k21, k22, k23, k24, k31, k32, k33, k34, k41, k42, k43, k44;//first index corresponds to each k of RK4, 2nd index corresponds to each y equation (i.e. Vdot,
-       //k1 values for each of the 4 y functions                                            //Gammadot, Hdot, or Xdot)
-       k11 = Vdot (vxw, gamma, h, CD);//k1 of Vdot
-       k12 = Gammadot (vxw, gamma, h, CL);//k1 of Gammadot
-       k13 = Hdot (vxw, gamma);//k1 of Hdot
-       k14 = Xdot (vxw, gamma);//k1 of Xdot
-       //k2 values
-       k21 = Vdot ((vxw+.5*k11*delta), (gamma+.5*k12*delta), (h+.5*k13*delta), CD);//k2 of Vdot
-       k22 = Gammadot ((vxw+.5*k11*delta), (gamma+.5*k12*delta), (h+.5*k13*delta), CL);//k2 of Gammadot
-       k23 = Hdot ((vxw+.5*k11*delta), (gamma+.5*k12*delta));//k2 of Hdot
-       k24 = Xdot ((vxw+.5*k11*delta), (gamma+.5*k12*delta));//k2 of Xdot
-       //k3 values
-       k31 = Vdot ((vxw+.5*k21*delta), (gamma+.5*k22*delta), (h+.5*k23*delta), CD);//and so on and so forth...
-       k32 = Gammadot ((vxw+.5*k21*delta), (gamma+.5*k22*delta), (h+.5*k23*delta), CL);
-       k33 = Hdot ((vxw+.5*k21*delta), (gamma+.5*k22*delta));
-       k34 = Xdot ((vxw+.5*k21*delta), (gamma+.5*k22*delta));
-       //k4 values
-       k41 = Vdot ((vxw+k31*delta), (gamma+k32*delta), (h+k33*delta), CD);
-       k42 = Gammadot ((vxw+k31*delta), (gamma+k32*delta), (h+k33*delta), CL);
-       k43 = Hdot ((vxw+k31*delta), (gamma+k32*delta));
-       k44 = Xdot ((vxw+k31*delta), (gamma+k32*delta));
-       //yi+1 for each of the 4 functions to be integrated based on the weighted average of the k values
-       y[0] = vxw + (1.0/6.0)*(k11+2.0*k21+2.0*k31+k41)*delta;//integrate Vdot
-       y[1] = gamma + (1.0/6.0)*(k12+2.0*k22+2.0*k32+k42)*delta;//integrate Gammadot
-       y[2] = h + (1.0/6.0)*(k13+2.0*k23+2.0*k33+k43)*delta;//integrate Hdot
-       y[3] = x + (1.0/6.0)*(k14+2.0*k24+2.0*k34+k44)*delta;//integrate Xdot
-       y[4] = Ground (y[3]);//plug Xdot into the ground elevation function to calculate the elevation at current X location
-       //the y[] array returns the values of the integrations from the void RK function because arrays are treated as pointers
-       y[5] = Veas (y[0], y[2]);
-       }
+Config parse(int argc, char** argv) {
+    Config c;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "-h" || a == "--help") { usage(); std::exit(0); }
+        else if (a == "--mode" && i + 1 < argc) c.mode = argv[++i];
+        else if (a == "--integrator" && i + 1 < argc) c.method = parse_method(argv[++i]);
+        else if (a == "--dt") c.io.dt = num(i, argc, argv);
+        else if (a == "--rtol") c.io.rtol = num(i, argc, argv);
+        else if (a == "--atol") c.io.atol = num(i, argc, argv);
+        else if (a == "--tmax") c.tmax = num(i, argc, argv);
+        else if (a == "--cl") { c.cl_min = c.cl_max = num(i, argc, argv); c.cl_step = 1.0; c.have_cl = true; }
+        else if (a == "--cl-min") { c.cl_min = num(i, argc, argv); c.have_cl = true; }
+        else if (a == "--cl-max") { c.cl_max = num(i, argc, argv); c.have_cl = true; }
+        else if (a == "--cl-step") c.cl_step = num(i, argc, argv);
+        else if (a == "--out" && i + 1 < argc) c.out = argv[++i];
+        else if (a == "--aileron") c.p3.da = num(i, argc, argv) * DEG;
+        else if (a == "--elevator") c.p3.de = num(i, argc, argv) * DEG;
+        else if (a == "--rudder") c.p3.dr = num(i, argc, argv) * DEG;
+        else if (a == "--no-renorm") c.p3.renormalize = false;
+        else if (a == "--stats") c.stats = true;
+        else throw std::invalid_argument("unknown option " + a + " (see --help)");
+    }
+    if (c.mode != "2d" && c.mode != "3d") throw std::invalid_argument("--mode must be 2d or 3d");
+    if (c.mode == "2d" && is_lie(c.method))
+        throw std::invalid_argument("lie-rk4/lie-rk45 act on the quaternion attitude and require --mode 3d");
+    if (!(c.io.dt > 0) || !(c.tmax > 0) || !(c.io.rtol > 0) || !(c.io.atol > 0))
+        throw std::invalid_argument("dt, tmax, rtol and atol must be positive");
+    if (c.out.empty()) c.out = (c.mode == "2d") ? "output.txt" : "output3d.csv";
+    return c;
+}
+
+enum class Status { Crash, Survive, NoResult };
+
+template <class Sys>
+struct Outcome {
+    Status status = Status::NoResult;
+    double t = 0.0;
+    double x_touch = 0.0;
+    Vec<Sys::N> y{};
+    IntegratorStats st;
+};
+
+// Integrate one case until the aircraft hits the terrain, passes X_END, loses airspeed or tmax.
+template <class Sys, class Writer>
+Outcome<Sys> run_case(const Sys& sys, const Vec<Sys::N>& y0, const Config& c, Writer&& write) {
+    Outcome<Sys> out;
+    double xPrev = Sys::dist(y0), cPrev = Sys::alt(y0) - ground(Sys::dist(y0));
+    bool first = true;
+    auto obs = [&](double t, const Vec<Sys::N>& y) {
+        write(t, y);
+        out.t = t;
+        out.y = y;
+        bool finite = true;
+        for (double v : y) finite = finite && std::isfinite(v);
+        if (!finite || Sys::airspeed(y) <= 0.0) { out.status = Status::NoResult; return false; }
+        const double x = Sys::dist(y), clr = Sys::alt(y) - ground(x);
+        if (!first && clr <= 0.0) {  // crashed: interpolate the touchdown point between samples
+            out.status = Status::Crash;
+            out.x_touch = xPrev + (x - xPrev) * (cPrev / (cPrev - clr));
+            return false;
+        }
+        if (x > X_END) { out.status = Status::Survive; return false; }
+        first = false;
+        xPrev = x;
+        cPrev = clr;
+        return true;
+    };
+    out.st = integrate(sys, c.method, 0.0, y0, c.tmax, c.io, obs);
+    return out;
+}
+
+void print_stats(const Config& c, const IntegratorStats& st) {
+    if (!c.stats) return;
+    std::cout << "[" << method_name(c.method) << ": " << st.steps << " steps, " << st.rejected << " rejected, "
+              << st.fevals << " f-evals]" << std::endl;
+}
+
+const char* status_text(Status s) {
+    return s == Status::Crash ? " CRASH!!!" : (s == Status::Survive ? " SURVIVE!!!" : " NO RESULT (airspeed lost or time limit reached)");
+}
+
+void run2d(const Config& c, double CL, std::ofstream& f) {
+    Sys2D sys(CL);
+    auto w = [&](double, const Vec<4>& y) {
+        f << y[3] << "     " << y[2] << "     " << y[0] << "      " << ground(y[3]) << "     " << y[1] << "     "
+          << veas(y[0], y[2]) << "     " << CL << "\n";
+    };
+    auto o = run_case(sys, Sys2D::initial(), c, w);
+    const auto& y = o.y;
+    std::cout << "CL = " << CL << status_text(o.status) << std::endl;
+    std::cout << "Vxw = " << y[0] << " gamma = " << y[1] << " Alt = " << y[2] << " x = " << y[3]
+              << " Elev = " << ground(y[3]) << "\nEquiv Airspeed = " << veas(y[0], y[2]);
+    if (o.status == Status::Crash) std::cout << "\nTouchdown (interpolated) x = " << o.x_touch;
+    std::cout << "  t = " << o.t << " s" << std::endl;
+    print_stats(c, o.st);
+    std::cout << std::endl;
+}
+
+void run3d(const Config& c, double CL, std::ofstream& f) {
+    Params3D p = c.p3;
+    p.CL_cmd = CL;
+    Sys3D sys(p);
+    auto w = [&](double t, const Vec<13>& y) {
+        const Quat q = Sys3D::quat(y);
+        const V3 e = qto_euler(q);
+        const AeroState a = sys.aero_state(y);
+        f << t << ',' << y[0] << ',' << y[1] << ',' << y[2] << ',' << -y[2] << ',' << ground(y[0]);
+        for (int i = 3; i < 13; ++i) f << ',' << y[i];
+        f << ',' << e[0] / DEG << ',' << e[1] / DEG << ',' << e[2] / DEG << ',' << a.alpha / DEG << ','
+          << a.beta / DEG << ',' << a.V << ',' << a.CL << ',' << qnorm(q) - 1.0 << ',' << CL << "\n";
+    };
+    auto o = run_case(sys, Sys3D::initial(), c, w);
+    const auto& y = o.y;
+    const V3 e = qto_euler(Sys3D::quat(y));
+    const V3 vn = body_to_ned(Sys3D::quat(y), Sys3D::vel(y));
+    const double V = norm(vn), gam = std::asin(-vn[2] / V);
+    std::cout << "CL = " << CL << status_text(o.status) << std::endl;
+    std::cout << "V = " << V << " gamma = " << gam << " Alt = " << -y[2] << " x = " << y[0] << " y = " << y[1]
+              << " Elev = " << ground(y[0]) << "\nroll/pitch/yaw (deg) = " << e[0] / DEG << " / " << e[1] / DEG
+              << " / " << e[2] / DEG << "  alpha (deg) = " << sys.aero_state(y).alpha / DEG
+              << "  |q|-1 = " << qnorm(Sys3D::quat(y)) - 1.0;
+    if (o.status == Status::Crash) std::cout << "\nTouchdown (interpolated) x = " << o.x_touch;
+    std::cout << "  t = " << o.t << " s" << std::endl;
+    print_stats(c, o.st);
+    std::cout << std::endl;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    Config c;
+    try {
+        c = parse(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "error: " << e.what() << std::endl;
+        return 2;
+    }
+
+    std::cout << "Takeoff From Matekane Airstrip (" << c.mode << " mode, " << method_name(c.method) << ")\n\n";
+    if (!c.have_cl) {
+        std::cout << "This program will simulate takeoff from the Matekane Airstrip \nat various lift coefficients.\n\n"
+                     "Input minimum lift coefficient: ";
+        std::cin >> c.cl_min;
+        std::cout << "\nInput maximum lift coefficient: ";
+        std::cin >> c.cl_max;
+        std::cout << "\nInput lift coefficient step size: ";
+        std::cin >> c.cl_step;
+        std::cout << "\n" << std::endl;
+        if (!std::cin) { std::cerr << "error: invalid input" << std::endl; return 2; }
+    }
+    if (!(c.cl_step > 0.0) || c.cl_max < c.cl_min) {
+        std::cerr << "error: need CLmin <= CLmax and step > 0" << std::endl;
+        return 2;
+    }
+
+    std::ofstream f(c.out);
+    if (c.mode == "2d") {
+        f << "# x(ft)  h(ft)  V(ft/s)  ground(ft)  gamma(rad)  Veas(ft/s)  CL\n";
+    } else {
+        f << "t,x_N,y_E,z_D,h,ground,u,v,w,qw,qx,qy,qz,p,q,r,phi_deg,theta_deg,psi_deg,alpha_deg,beta_deg,V,CL,"
+             "qnorm_err,CL_cmd\n";
+    }
+    f << std::setprecision(10);
+
+    const int n = sweep_count(c.cl_min, c.cl_max, c.cl_step);
+    for (int i = 0; i < n; ++i) {
+        const double CL = c.cl_min + i * c.cl_step;
+        if (CL > CL_MAX + 1e-12) {
+            std::cout << "CL = " << CL << " exceeds CLMax = " << CL_MAX << " (stalled wing) - skipped\n" << std::endl;
+            continue;
+        }
+        if (c.mode == "2d") run2d(c, CL, f);
+        else run3d(c, CL, f);
+    }
+    std::cout << "Trajectory written to " << c.out << std::endl;
+    return 0;
+}
